@@ -1,8 +1,13 @@
+import json
+import time
+import uuid  # <--- Added for unique DOM IDs
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 
 # -------------------------------------------------------------------
 # Basic app config
@@ -17,6 +22,52 @@ st.set_page_config(
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUTS_DIR = BASE_DIR / "outputs"
 DATA_DIR = BASE_DIR / "data"
+LOGS_LIVE_DIR = BASE_DIR / "logs_live"
+LOGS_LIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+# File to persist timer state
+TIMER_STATE_FILE = LOGS_LIVE_DIR / "timer_state.json"
+
+
+def load_timer_state() -> dict:
+    """Load timer state from file."""
+    if TIMER_STATE_FILE.exists():
+        try:
+            with TIMER_STATE_FILE.open("r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_timer_state(start_time: datetime) -> None:
+    """Save timer state to file."""
+    try:
+        with TIMER_STATE_FILE.open("w") as f:
+            json.dump({
+                "start_time": start_time.isoformat(),
+            }, f)
+    except Exception as e:
+        st.error(f"Error saving timer state: {e}")
+
+
+def get_persistent_start_time() -> datetime:
+    """Get start time from file or create new one."""
+    state = load_timer_state()
+    if "start_time" in state:
+        try:
+            saved_start = datetime.fromisoformat(state["start_time"])
+            # Check if timer has expired (more than 24 hours old)
+            elapsed = datetime.now(timezone.utc) - saved_start
+            if elapsed.total_seconds() < 86400:  # Less than 24 hours
+                return saved_start
+            # Timer expired, create new one
+        except Exception:
+            pass
+    # Create new start time
+    new_start = datetime.now(timezone.utc)
+    save_timer_state(new_start)
+    return new_start
 
 # -------------------------------------------------------------------
 # Data loading helpers
@@ -128,13 +179,6 @@ trades = load_trades()
 markets_meta = load_markets_meta()
 
 st.title("META-PM Strategy Dashboard")
-
-if scores.empty and scores_by_market.empty and trades.empty:
-    st.error(
-        "No data found. Make sure you've run the engine and evaluator so that "
-        "outputs/scores*.csv and outputs/trades*.csv exist."
-    )
-    st.stop()
 
 # -------------------------------------------------------------------
 # Sidebar filters
@@ -251,8 +295,8 @@ col4.metric("Avg. Brier", f"{avg_brier:0.4f}" if avg_brier is not None else "N/A
 # Tabs: Leaderboard | Per Market | Strategy Detail | Performance Over Time
 # -------------------------------------------------------------------
 
-tab_leaderboard, tab_per_market, tab_strategy, tab_perf = st.tabs(
-    ["Leaderboard", "Per Market", "Strategy Detail", "Performance Over Time"]
+tab_leaderboard, tab_per_market, tab_strategy, tab_perf, tab_live = st.tabs(
+    ["Leaderboard", "Per Market", "Strategy Detail", "Performance Over Time", "Live Trading"]
 )
 
 # -------------------------------------------------------------------
@@ -633,3 +677,476 @@ with tab_perf:
                     st.info("No trades in the selected markets for current filters.")
             else:
                 st.info("Select at least one market to see per-market curves.")
+
+# -------------------------------------------------------------------
+# Live Trading tab (FIXED with Unique IDs for Timer)
+# -------------------------------------------------------------------
+
+with tab_live:
+    # Always read timer directly from file (single source of truth)
+    # This ensures frontend and backend are always in sync
+    timer_start_time = get_persistent_start_time()
+    
+    # Store in session state for this render cycle only
+    st.session_state.live_start_time = timer_start_time
+    
+    # Initialize session state for live trading config
+    if "live_auto_refresh" not in st.session_state:
+        st.session_state.live_auto_refresh = True
+    if "last_refresh_time" not in st.session_state:
+        st.session_state.last_refresh_time = time.time()
+    if "refresh_interval" not in st.session_state:
+        st.session_state.refresh_interval = 5
+    
+    # --- AUTO REFRESH LOGIC ---
+    # Check for auto-refresh BEFORE rendering
+    auto_refresh = st.session_state.live_auto_refresh
+    if auto_refresh:
+        current_time = time.time()
+        time_since_refresh = current_time - st.session_state.last_refresh_time
+        
+        if time_since_refresh >= st.session_state.refresh_interval:
+            st.session_state.last_refresh_time = current_time
+            st.rerun()
+    
+    st.subheader("Live Trading Dashboard")
+    
+    # Control panel
+    col_control1, col_control2, col_control3, col_control4 = st.columns(4)
+    
+    with col_control1:
+        auto_refresh_checkbox = st.checkbox("🔄 Auto-refresh", value=st.session_state.live_auto_refresh)
+        if auto_refresh_checkbox != st.session_state.live_auto_refresh:
+            st.session_state.live_auto_refresh = auto_refresh_checkbox
+            st.session_state.last_refresh_time = time.time()
+            st.rerun()
+    
+    with col_control2:
+        interval_options = [3, 5, 10, 15, 30, 60]
+        current_interval = st.session_state.refresh_interval
+        try:
+            current_index = interval_options.index(current_interval)
+        except ValueError:
+            current_index = 1
+        
+        refresh_interval = st.selectbox(
+            "Refresh interval",
+            options=interval_options,
+            index=current_index,
+            format_func=lambda x: f"{x}s",
+            key="refresh_interval_select"
+        )
+        if refresh_interval != st.session_state.refresh_interval:
+            st.session_state.refresh_interval = refresh_interval
+            st.session_state.last_refresh_time = time.time()
+            st.rerun()
+    
+    with col_control3:
+        if st.button("🔄 Refresh Now"):
+            st.session_state.last_refresh_time = time.time()
+            st.rerun()
+    
+    with col_control4:
+        if st.button("⏱️ Reset Timer"):
+            new_start = datetime.now(timezone.utc)
+            save_timer_state(new_start)  # Save to file (single source of truth)
+            st.session_state.last_refresh_time = time.time()
+            st.rerun()
+    
+    # Auto-refresh status display
+    refresh_status_placeholder = st.empty()
+    if auto_refresh:
+        current_time = time.time()
+        time_since_refresh = current_time - st.session_state.last_refresh_time
+        time_until_refresh = max(0, st.session_state.refresh_interval - time_since_refresh)
+        
+        refresh_status_placeholder.info(
+            f"🔄 Auto-refreshing every {st.session_state.refresh_interval}s. "
+            f"Next refresh in {int(time_until_refresh)}s | "
+            f"Last update: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
+        )
+    else:
+        refresh_status_placeholder.empty()
+    
+    # Timer Logic - Always use the timer from file (single source of truth)
+    # Re-read from file to ensure we have the latest state (in case backend updated it)
+    timer_start_time = get_persistent_start_time()
+    
+    # Check if expired and reset if needed
+    elapsed_check = datetime.now(timezone.utc) - timer_start_time
+    elapsed_seconds_check = elapsed_check.total_seconds()
+    
+    # If timer expired (>= 24 hours) or is negative (timezone issue), reset it
+    if elapsed_seconds_check >= 86400 or elapsed_seconds_check < 0:
+        new_start = datetime.now(timezone.utc)
+        save_timer_state(new_start)
+        timer_start_time = new_start
+        st.info("⏱️ Timer expired. Starting new 24-hour session.")
+        # Force rerun to use the new timer
+        st.rerun()
+    
+    # --- TIMER DISPLAY - Always sync with backend timer file ---
+    # Calculate Unix timestamp in milliseconds for JavaScript (from shared timer file)
+    start_time_unix = int(timer_start_time.timestamp() * 1000)
+    
+    # Calculate remaining time for display
+    elapsed_for_display = datetime.now(timezone.utc) - timer_start_time
+    remaining_seconds_display = max(0, 86400 - elapsed_for_display.total_seconds())
+    hours_display = int(remaining_seconds_display // 3600)
+    minutes_display = int((remaining_seconds_display % 3600) // 60)
+    seconds_display = int(remaining_seconds_display % 60)
+    progress_display = min(100, (elapsed_for_display.total_seconds() / 86400) * 100)
+    
+    # Show timer status
+    st.info(f"⏱️ **Competition Timer**: Started at {timer_start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC | "
+            f"Remaining: ~{hours_display}h {minutes_display}m | "
+            f"Timer file: `{TIMER_STATE_FILE.name}`")
+    
+    # Generate a unique ID for this specific render
+    timer_uid = str(uuid.uuid4())
+    
+    # Use Streamlit components for reliable JavaScript execution
+    timer_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            .timer-container {{
+                margin: 20px 0;
+                font-family: Arial, sans-serif;
+            }}
+            .timer-display {{
+                display: flex;
+                gap: 20px;
+                justify-content: center;
+            }}
+            .timer-item {{
+                text-align: center;
+            }}
+            .timer-label {{
+                font-size: 14px;
+                color: #666;
+                margin-bottom: 5px;
+            }}
+            .timer-value {{
+                font-size: 32px;
+                font-weight: bold;
+                color: #1f77b4;
+            }}
+            .progress-container {{
+                margin-top: 20px;
+            }}
+            .progress-label {{
+                font-size: 12px;
+                color: #666;
+                margin-bottom: 5px;
+            }}
+            .progress-bar-bg {{
+                width: 100%;
+                background-color: #f0f0f0;
+                border-radius: 10px;
+                height: 20px;
+                overflow: hidden;
+            }}
+            .progress-bar-fill {{
+                height: 100%;
+                background-color: #1f77b4;
+                transition: width 1s linear;
+            }}
+            .progress-text {{
+                text-align: center;
+                margin-top: 5px;
+                font-size: 12px;
+                color: #666;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="timer-container">
+            <div class="timer-display">
+                <div class="timer-item">
+                    <div class="timer-label">Hours</div>
+                    <div class="timer-value" id="hours-{timer_uid}">{hours_display:02d}</div>
+                </div>
+                <div class="timer-item">
+                    <div class="timer-label">Minutes</div>
+                    <div class="timer-value" id="minutes-{timer_uid}">{minutes_display:02d}</div>
+                </div>
+                <div class="timer-item">
+                    <div class="timer-label">Seconds</div>
+                    <div class="timer-value" id="seconds-{timer_uid}">{seconds_display:02d}</div>
+                </div>
+            </div>
+            <div class="progress-container">
+                <div class="progress-label">Session Progress</div>
+                <div class="progress-bar-bg">
+                    <div class="progress-bar-fill" id="progress-bar-{timer_uid}" style="width: {progress_display}%;"></div>
+                </div>
+                <div class="progress-text" id="progress-text-{timer_uid}">{progress_display:.1f}%</div>
+            </div>
+        </div>
+        <script>
+        (function() {{
+            const startTimeMs = {start_time_unix};
+            const totalDurationMs = 86400000;
+            
+            function updateTimer() {{
+                const elHours = document.getElementById('hours-{timer_uid}');
+                const elMinutes = document.getElementById('minutes-{timer_uid}');
+                const elSeconds = document.getElementById('seconds-{timer_uid}');
+                const elProgress = document.getElementById('progress-bar-{timer_uid}');
+                const elText = document.getElementById('progress-text-{timer_uid}');
+                
+                if (!elHours || !elMinutes || !elSeconds) {{
+                    setTimeout(updateTimer, 100);
+                    return;
+                }}
+                
+                const now = Date.now();
+                const elapsed = now - startTimeMs;
+                const remaining = Math.max(0, totalDurationMs - elapsed);
+                
+                if (remaining <= 0) {{
+                    elHours.textContent = '00';
+                    elMinutes.textContent = '00';
+                    elSeconds.textContent = '00';
+                    if (elProgress) elProgress.style.width = '100%';
+                    if (elText) elText.textContent = '100.0% - Session Complete';
+                    return;
+                }}
+                
+                const hours = Math.floor(remaining / 3600000);
+                const minutes = Math.floor((remaining % 3600000) / 60000);
+                const secs = Math.floor((remaining % 60000) / 1000);
+                
+                elHours.textContent = String(hours).padStart(2, '0');
+                elMinutes.textContent = String(minutes).padStart(2, '0');
+                elSeconds.textContent = String(secs).padStart(2, '0');
+                
+                const progress = (elapsed / totalDurationMs) * 100;
+                if (elProgress) elProgress.style.width = Math.min(100, progress) + '%';
+                if (elText) elText.textContent = Math.min(100, progress).toFixed(1) + '%';
+            }}
+            
+            // Start immediately
+            updateTimer();
+            setInterval(updateTimer, 1000);
+        }})();
+        </script>
+    </body>
+    </html>
+    """
+    
+    components.html(timer_html, height=200)
+    
+    # Load live data
+    DATA_LIVE_DIR = BASE_DIR / "data_live"
+    LOGS_LIVE_DIR = BASE_DIR / "logs_live"
+    
+    live_meta_path = DATA_LIVE_DIR / "markets_live_meta.csv"
+    live_trades_path = LOGS_LIVE_DIR / "live_trades.csv"
+    
+    if not live_meta_path.exists():
+        st.warning("No live market data found. Run `python fetch_polymarket_live_24h.py` first, then start the live data service.")
+        st.code("python live_data_service.py --interval 60")
+    else:
+        # Load live markets
+        try:
+            live_markets_meta = read_csv_if_exists(live_meta_path)
+            live_trades_df = read_csv_if_exists(
+                live_trades_path,
+                parse_dates=["entry_time"]
+            )
+            
+            if live_markets_meta.empty:
+                st.warning("No live markets configured.")
+            else:
+                # Live market status
+                st.markdown("### Live Markets")
+                
+                # Group by event_slug (preferred) or slug
+                group_col = "event_slug" if "event_slug" in live_markets_meta.columns else "slug"
+                
+                if group_col in live_markets_meta.columns:
+                    grouped = live_markets_meta.groupby(group_col)
+                    for group_name, group in grouped:
+                        # Use group name as header
+                        header_name = str(group_name).replace("-", " ").title()
+                        
+                        # Sort group by outcome probability desc
+                        if "outcome" in group.columns:
+                            group["outcome_val"] = pd.to_numeric(group["outcome"], errors="coerce").fillna(0)
+                            group = group.sort_values("outcome_val", ascending=False)
+                        
+                        with st.expander(f"{header_name} ({len(group)} outcomes)", expanded=True):
+                            market_cols = st.columns(min(4, len(group)))
+                            for idx, (_, market) in enumerate(group.iterrows()):
+                                with market_cols[idx % len(market_cols)]:
+                                    outcome = float(market.get("outcome", 0)) if market.get("outcome") else 0.0
+                                    # Use Question/Outcome name
+                                    name = market.get("name", market.get("market_id", "Unknown"))
+                                    # Truncate long names but keep them identifiable
+                                    if "will-the-" in name.lower():
+                                        name = name.lower().replace("will-the-", "").replace("-win-super-bowl-2026", "").title()
+                                    elif "will-" in name.lower():
+                                        name = name.lower().replace("will-", "").replace("-win-the-chilean-presidential-election", "").title()
+                                        
+                                    st.metric(
+                                        name[:40],
+                                        f"{outcome:.3f}",
+                                        delta=None,
+                                        help=f"Last updated: {market.get('last_updated', 'N/A')}"
+                                    )
+                else:
+                    # Fallback if no slug
+                    market_cols = st.columns(min(5, len(live_markets_meta)))
+                    for idx, (_, market) in enumerate(live_markets_meta.iterrows()):
+                        with market_cols[idx % len(market_cols)]:
+                            outcome = float(market.get("outcome", 0)) if market.get("outcome") else 0.0
+                            st.metric(
+                                market.get("name", market.get("market_id", "Unknown"))[:30],
+                                f"{outcome:.3f}",
+                                delta=None,
+                            )
+                
+                # Live trades feed
+                st.markdown("### Recent Trades")
+                
+                if live_trades_df.empty:
+                    st.info("No trades yet. Waiting for strategies to generate trades...")
+                else:
+                    # Process trades
+                    for col in ["entry_price", "size", "p_hat", "outcome", "pnl", "capital_at_entry"]:
+                        if col in live_trades_df.columns:
+                            live_trades_df[col] = pd.to_numeric(live_trades_df[col], errors="coerce")
+                    
+                    # Show last 20 trades
+                    recent_trades = live_trades_df.tail(20).sort_values("entry_time", ascending=False)
+                    
+                    # Trade feed table
+                    st.dataframe(
+                        recent_trades[
+                            ["strategy_name", "market_id", "entry_time", "side", "entry_price", "pnl", "capital_at_entry"]
+                        ],
+                        use_container_width=True,
+                        height=400,
+                    )
+                    
+                    # Strategy performance
+                    st.markdown("### Strategy Performance (Live)")
+                    
+                    if not live_trades_df.empty:
+                        # Calculate cumulative P&L per strategy
+                        live_trades_sorted = live_trades_df.sort_values("entry_time")
+                        strategy_perf = []
+                        
+                        for strategy in live_trades_sorted["strategy_name"].unique():
+                            strat_trades = live_trades_sorted[live_trades_sorted["strategy_name"] == strategy]
+                            total_pnl = strat_trades["pnl"].sum()
+                            n_trades = len(strat_trades)
+                            # Calculate current capital
+                            if len(strat_trades) > 0:
+                                last_capital = strat_trades["capital_at_entry"].iloc[-1]
+                                last_pnl = strat_trades["pnl"].iloc[-1]
+                                current_capital = last_capital + last_pnl
+                            else:
+                                current_capital = 100.0
+                            
+                            strategy_perf.append({
+                                "strategy_name": strategy,
+                                "total_pnl": total_pnl,
+                                "current_capital": current_capital,
+                                "n_trades": n_trades,
+                            })
+                        
+                        perf_df = pd.DataFrame(strategy_perf)
+                        perf_df = perf_df.sort_values("total_pnl", ascending=False)
+                        
+                        # Performance metrics
+                        perf_cols = st.columns(4)
+                        with perf_cols[0]:
+                            st.metric("Total Strategies", len(perf_df))
+                        with perf_cols[1]:
+                            st.metric("Total Trades", int(perf_df["n_trades"].sum()))
+                        with perf_cols[2]:
+                            st.metric("Total P&L", f"{perf_df['total_pnl'].sum():.3f}")
+                        with perf_cols[3]:
+                            best_strat = perf_df.iloc[0]["strategy_name"] if not perf_df.empty else "N/A"
+                            st.metric("Best Strategy", best_strat[:20])
+                        
+                        # Leaderboard
+                        st.dataframe(
+                            perf_df,
+                            use_container_width=True,
+                            height=300,
+                        )
+                        
+                        # Live equity curves
+                        st.markdown("### Live Equity Curves")
+                        
+                        live_trades_sorted["cum_pnl"] = live_trades_sorted.groupby("strategy_name")["pnl"].cumsum()
+                        
+                        fig_live = px.line(
+                            live_trades_sorted,
+                            x="entry_time",
+                            y="cum_pnl",
+                            color="strategy_name",
+                            title="Cumulative P&L Over Time (Live)",
+                        )
+                        fig_live.update_layout(
+                            xaxis_title="Time",
+                            yaxis_title="Cumulative P&L",
+                        )
+                        st.plotly_chart(fig_live, use_container_width=True)
+                        
+                        # Per-strategy breakdown
+                        st.markdown("### Per-Strategy Breakdown")
+                        
+                        selected_live_strategy = st.selectbox(
+                            "Select strategy",
+                            options=perf_df["strategy_name"].tolist(),
+                            key="live_strategy_select",
+                        )
+                        
+                        if selected_live_strategy:
+                            strat_trades_live = live_trades_sorted[
+                                live_trades_sorted["strategy_name"] == selected_live_strategy
+                            ]
+                            
+                            if not strat_trades_live.empty:
+                                col_live1, col_live2 = st.columns(2)
+                                
+                                with col_live1:
+                                    fig_strat_pnl = px.line(
+                                        strat_trades_live,
+                                        x="entry_time",
+                                        y="cum_pnl",
+                                        title=f"{selected_live_strategy} - Equity Curve",
+                                    )
+                                    fig_strat_pnl.update_layout(
+                                        xaxis_title="Time",
+                                        yaxis_title="Cumulative P&L",
+                                    )
+                                    st.plotly_chart(fig_strat_pnl, use_container_width=True)
+                                
+                                with col_live2:
+                                    fig_strat_trades = px.scatter(
+                                        strat_trades_live,
+                                        x="entry_time",
+                                        y="entry_price",
+                                        size="size",
+                                        color="pnl",
+                                        symbol="side",
+                                        title=f"{selected_live_strategy} - Trades",
+                                        color_continuous_scale="RdYlGn",
+                                    )
+                                    fig_strat_trades.update_layout(
+                                        xaxis_title="Time",
+                                        yaxis_title="Entry Price",
+                                    )
+                                    st.plotly_chart(fig_strat_trades, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error loading live data: {e}")
+            
+    # Note: Auto-refresh logic is handled at the top of this tab block via st.rerun()
+    # No extra JS injection needed for reloading the page.

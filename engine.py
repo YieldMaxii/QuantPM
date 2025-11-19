@@ -59,12 +59,13 @@ from typing import List, Optional, Dict, Iterable, Tuple
 class MarketSeries:
     market_id: str
     name: str
-    outcome: int  # 0 or 1
+    outcome: float  # usually 0/1 for resolved markets, but can be any [0,1] terminal price
     ts: List[datetime]
     price: List[float]
     bid: Optional[List[float]] = None
     ask: Optional[List[float]] = None
     volume: Optional[List[float]] = None
+    slug: Optional[str] = None  # Added for event grouping
 
 
 @dataclass
@@ -86,8 +87,9 @@ class TradeRecord:
     entry_price: float
     size: float
     p_hat: float
-    outcome: int
+    outcome: float
     pnl: float
+    capital_at_entry: float  # capital available when this trade was made
 
 
 @dataclass
@@ -124,7 +126,8 @@ def load_markets(meta_csv: Path, prices_dir: Path) -> List[MarketSeries]:
         for row in reader:
             market_id = row["market_id"]
             name = row.get("name", market_id)
-            outcome = int(row["outcome"])
+            outcome = float(row["outcome"])
+            slug = row.get("slug", "")  # Read slug if available
 
             prices_path = prices_dir / f"prices_{market_id}.csv"
             if not prices_path.exists():
@@ -166,6 +169,7 @@ def load_markets(meta_csv: Path, prices_dir: Path) -> List[MarketSeries]:
                     bid=bid_arr,
                     ask=ask_arr,
                     volume=vol_arr,
+                    slug=slug,
                 )
             )
 
@@ -355,7 +359,7 @@ class OracleStrategy(BaseStrategy):
 def compute_trade_pnl(
     side: str,
     entry_price: float,
-    outcome: int,
+    outcome: float,
     size_fraction: float,
     bankroll: float,
 ) -> float:
@@ -375,7 +379,7 @@ def compute_trade_pnl(
     return unit_pnl * units
 
 
-def brier_score(p_hat: float, outcome: int) -> float:
+def brier_score(p_hat: float, outcome: float) -> float:
     return (p_hat - outcome) ** 2
 
 
@@ -456,17 +460,24 @@ def run_backtest(
     strategies: Iterable[BaseStrategy],
     bankroll: float,
 ) -> Tuple[List[TradeRecord], List[StrategyScores]]:
+    """
+    Run backtest with built-in strategies.
+    
+    Each strategy starts with the same initial bankroll.
+    Trades are processed chronologically per strategy, with capital tracking:
+    - Each trade is sized using current capital (not initial bankroll)
+    - Capital is updated after each trade based on P&L
+    """
     trades: List[TradeRecord] = []
     scores: List[StrategyScores] = []
 
     # Build a quick lookup by market_id
     markets_list = list(markets)
+    market_by_id: Dict[str, MarketSeries] = {m.market_id: m for m in markets_list}
 
-    # Collect trades per strategy
-    trades_by_strategy: Dict[str, List[TradeRecord]] = {}
-    brier_sum: Dict[str, float] = {}
-    trade_count: Dict[str, int] = {}
-
+    # Collect all decisions first, then process chronologically per strategy
+    all_decisions: List[Tuple[BaseStrategy, StrategyDecision, datetime]] = []
+    
     for strat in strategies:
         for market in markets_list:
             decision = strat.decide(market)
@@ -478,14 +489,45 @@ def run_backtest(
                 continue  # skip invalid index
 
             entry_time = market.ts[idx]
+            all_decisions.append((strat, decision, entry_time))
+
+    # Group by strategy and sort chronologically
+    decisions_by_strategy: Dict[str, List[Tuple[BaseStrategy, StrategyDecision, datetime]]] = {}
+    for strat, decision, entry_time in all_decisions:
+        decisions_by_strategy.setdefault(strat.name, []).append((strat, decision, entry_time))
+
+    trades_by_strategy: Dict[str, List[TradeRecord]] = {}
+    brier_sum: Dict[str, float] = {}
+    trade_count: Dict[str, int] = {}
+
+    # Process each strategy's trades chronologically with capital tracking
+    for strat_name, decision_list in decisions_by_strategy.items():
+        # Sort by entry time
+        decision_list.sort(key=lambda x: x[2])
+
+        # Track running capital for this strategy
+        current_capital = bankroll
+
+        for strat, decision, entry_time in decision_list:
+            market = market_by_id.get(decision.market_id)
+            if market is None:
+                continue
+
+            idx = decision.entry_index
+            if idx < 0 or idx >= len(market.price):
+                continue
+
             entry_price = market.price[idx]
+
+            # Use current capital for position sizing
             pnl = compute_trade_pnl(
                 side=decision.side,
                 entry_price=entry_price,
                 outcome=market.outcome,
                 size_fraction=decision.size,
-                bankroll=bankroll,
+                bankroll=current_capital,  # Use current capital, not initial bankroll
             )
+
             tr = TradeRecord(
                 strategy_name=decision.strategy_name,
                 market_id=market.market_id,
@@ -496,28 +538,30 @@ def run_backtest(
                 p_hat=decision.p_hat,
                 outcome=market.outcome,
                 pnl=pnl,
+                capital_at_entry=current_capital,
             )
+
             trades.append(tr)
-            trades_by_strategy.setdefault(strat.name, []).append(tr)
-            brier_sum[strat.name] = brier_sum.get(strat.name, 0.0) + brier_score(
+            trades_by_strategy.setdefault(strat_name, []).append(tr)
+            brier_sum[strat_name] = brier_sum.get(strat_name, 0.0) + brier_score(
                 decision.p_hat, market.outcome
             )
-            trade_count[strat.name] = trade_count.get(strat.name, 0) + 1
+            trade_count[strat_name] = trade_count.get(strat_name, 0) + 1
+
+            # Update capital after trade
+            current_capital += pnl
 
     # Compute per-strategy metrics
-    for strat in strategies:
-        name = strat.name
-        strat_trades = trades_by_strategy.get(name, [])
-        # Sort by entry_time for equity / drawdown
+    for strat_name, strat_trades in trades_by_strategy.items():
         strat_trades.sort(key=lambda t: t.entry_time)
         _, max_dd = compute_equity_and_drawdown(strat_trades)
-        n = trade_count.get(name, 0)
+        n = trade_count.get(strat_name, 0)
         total_pnl = sum(t.pnl for t in strat_trades)
-        brier_mean = brier_sum[name] / n if n > 0 else None
+        brier_mean = brier_sum[strat_name] / n if n > 0 else None
 
         scores.append(
             StrategyScores(
-                strategy_name=name,
+                strategy_name=strat_name,
                 total_pnl=total_pnl,
                 brier_mean=brier_mean,
                 max_drawdown=max_dd if n > 0 else None,
@@ -546,6 +590,9 @@ def evaluate_trade_log(
 
     The engine:
         - Looks up canonical prices via market_id and entry_index.
+        - Processes trades chronologically per strategy.
+        - Tracks running capital per strategy (starts at bankroll, updates after each trade).
+        - Uses current capital for position sizing (size_fraction * current_capital).
         - Computes PnL using compute_trade_pnl (settling at final outcome).
         - Aggregates per-strategy scores (total_pnl, Brier, max_drawdown, n_trades).
 
@@ -555,51 +602,78 @@ def evaluate_trade_log(
     markets_list = list(markets)
     market_by_id: Dict[str, MarketSeries] = {m.market_id: m for m in markets_list}
 
+    # Group trade specs by strategy and create tuples with entry_time for sorting
+    specs_with_time: List[Tuple[StrategyDecision, datetime]] = []
+    for spec in trade_specs:
+        market = market_by_id.get(spec.market_id)
+        if market is None:
+            continue
+        idx = spec.entry_index
+        if idx < 0 or idx >= len(market.price):
+            continue
+        entry_time = market.ts[idx]
+        specs_with_time.append((spec, entry_time))
+
+    # Group by strategy and sort chronologically
+    specs_by_strategy: Dict[str, List[Tuple[StrategyDecision, datetime]]] = {}
+    for spec, entry_time in specs_with_time:
+        specs_by_strategy.setdefault(spec.strategy_name, []).append((spec, entry_time))
+
+    # Process each strategy's trades chronologically with capital tracking
     trades: List[TradeRecord] = []
     trades_by_strategy: Dict[str, List[TradeRecord]] = {}
     brier_sum: Dict[str, float] = {}
     trade_count: Dict[str, int] = {}
 
-    for spec in trade_specs:
-        market = market_by_id.get(spec.market_id)
-        if market is None:
-            # Unknown market_id; skip or log.
-            continue
+    for strat_name, spec_list in specs_by_strategy.items():
+        # Sort by entry time
+        spec_list.sort(key=lambda x: x[1])
 
-        idx = spec.entry_index
-        if idx < 0 or idx >= len(market.price):
-            # Invalid index for this market; skip or log.
-            continue
+        # Track running capital for this strategy
+        current_capital = bankroll
 
-        entry_time = market.ts[idx]
-        entry_price = market.price[idx]
+        for spec, entry_time in spec_list:
+            market = market_by_id.get(spec.market_id)
+            if market is None:
+                continue
 
-        pnl = compute_trade_pnl(
-            side=spec.side,
-            entry_price=entry_price,
-            outcome=market.outcome,
-            size_fraction=spec.size,
-            bankroll=bankroll,
-        )
+            idx = spec.entry_index
+            if idx < 0 or idx >= len(market.price):
+                continue
 
-        tr = TradeRecord(
-            strategy_name=spec.strategy_name,
-            market_id=spec.market_id,
-            entry_time=entry_time,
-            side=spec.side,
-            entry_price=entry_price,
-            size=spec.size,
-            p_hat=spec.p_hat,
-            outcome=market.outcome,
-            pnl=pnl,
-        )
+            entry_price = market.price[idx]
 
-        trades.append(tr)
-        trades_by_strategy.setdefault(spec.strategy_name, []).append(tr)
-        brier_sum[spec.strategy_name] = brier_sum.get(spec.strategy_name, 0.0) + brier_score(
-            spec.p_hat, market.outcome
-        )
-        trade_count[spec.strategy_name] = trade_count.get(spec.strategy_name, 0) + 1
+            # Use current capital for position sizing
+            pnl = compute_trade_pnl(
+                side=spec.side,
+                entry_price=entry_price,
+                outcome=market.outcome,
+                size_fraction=spec.size,
+                bankroll=current_capital,  # Use current capital, not initial bankroll
+            )
+
+            tr = TradeRecord(
+                strategy_name=spec.strategy_name,
+                market_id=spec.market_id,
+                entry_time=entry_time,
+                side=spec.side,
+                entry_price=entry_price,
+                size=spec.size,
+                p_hat=spec.p_hat,
+                outcome=market.outcome,
+                pnl=pnl,
+                capital_at_entry=current_capital,
+            )
+
+            trades.append(tr)
+            trades_by_strategy.setdefault(strat_name, []).append(tr)
+            brier_sum[strat_name] = brier_sum.get(strat_name, 0.0) + brier_score(
+                spec.p_hat, market.outcome
+            )
+            trade_count[strat_name] = trade_count.get(strat_name, 0) + 1
+
+            # Update capital after trade (capital grows/shrinks with P&L)
+            current_capital += pnl
 
     # Aggregate per-strategy scores
     scores: List[StrategyScores] = []
@@ -636,6 +710,7 @@ def write_trades_csv(trades: List[TradeRecord], out_path: Path) -> None:
         "p_hat",
         "outcome",
         "pnl",
+        "capital_at_entry",
     ]
     with out_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -650,8 +725,9 @@ def write_trades_csv(trades: List[TradeRecord], out_path: Path) -> None:
                     "entry_price": f"{tr.entry_price:.6f}",
                     "size": f"{tr.size:.6f}",
                     "p_hat": f"{tr.p_hat:.6f}",
-                    "outcome": tr.outcome,
+                    "outcome": f"{tr.outcome:.6f}",
                     "pnl": f"{tr.pnl:.6f}",
+                    "capital_at_entry": f"{tr.capital_at_entry:.6f}",
                 }
             )
 
