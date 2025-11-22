@@ -33,3 +33,7 @@ outputs/
 .DS_Store
 Thumbs.db
 
+# Node
+node_modules/
+frontend/node_modules/
+

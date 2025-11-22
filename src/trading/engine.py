@@ -313,12 +313,28 @@ class LiveTradingEngine:
             
             # Reload markets to ensure clean state (force reload after reset)
             self.load_markets(force_reload=True)
-            return {"status": "reset_complete", "new_trades": 0}
+            return {
+                "status": "reset_complete", 
+                "new_trades": 0,
+                "total_trades": 0,
+                "markets": 0,
+                "strategies": 0,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timer_remaining_seconds": 86400
+            }
         # -----------------------------------
 
         # Only reload markets if files have changed (cached otherwise)
         if not self.load_markets():
-            return {"status": "no_markets", "new_trades": 0}
+            return {
+                "status": "no_markets", 
+                "new_trades": 0,
+                "total_trades": len(self.all_trades),
+                "markets": 0,
+                "strategies": len(self.capital_tracker),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timer_remaining_seconds": 86400 # Approximate
+            }
 
         # --- NEW: Mark-to-Market Update ---
         # Update PNL for ALL trades based on latest market prices
@@ -403,32 +419,35 @@ class LiveTradingEngine:
     
     def save_all_trades(self) -> None:
         """Rewrite the entire trade log with current PNLs (atomic write)."""
-        log_path = LOGS_LIVE_DIR / "live_trades.csv"
-        temp_path = LOGS_LIVE_DIR / "live_trades.csv.tmp"
+        log_path = LOGS_LIVE_DIR.resolve() / "live_trades.csv"
+        temp_path = LOGS_LIVE_DIR.resolve() / "live_trades.csv.tmp"
         
-        with temp_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "strategy_name", "market_id", "entry_time", "side",
-                "entry_price", "size", "p_hat", "outcome", "pnl", "capital_at_entry"
-            ])
-            
-            for trade in self.all_trades:
+        try:
+            with temp_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
                 writer.writerow([
-                    trade.strategy_name,
-                    trade.market_id,
-                    trade.entry_time.isoformat(),
-                    trade.side,
-                    f"{trade.entry_price:.6f}",
-                    f"{trade.size:.6f}",
-                    f"{trade.p_hat:.6f}",
-                    f"{trade.outcome:.6f}",
-                    f"{trade.pnl:.6f}",
-                    f"{trade.capital_at_entry:.6f}",
+                    "strategy_name", "market_id", "entry_time", "side",
+                    "entry_price", "size", "p_hat", "outcome", "pnl", "capital_at_entry"
                 ])
-        
-        # Atomic rename to ensure dashboard never reads partial file
-        temp_path.replace(log_path)
+                
+                for trade in self.all_trades:
+                    writer.writerow([
+                        trade.strategy_name,
+                        trade.market_id,
+                        trade.entry_time.isoformat(),
+                        trade.side,
+                        f"{trade.entry_price:.6f}",
+                        f"{trade.size:.6f}",
+                        f"{trade.p_hat:.6f}",
+                        f"{trade.outcome:.6f}",
+                        f"{trade.pnl:.6f}",
+                        f"{trade.capital_at_entry:.6f}",
+                    ])
+            
+            # Atomic rename
+            temp_path.replace(log_path)
+        except Exception as e:
+            print(f"Error saving trades: {e}")
     
     def get_strategy_performance(self) -> Dict[str, Dict[str, float]]:
         """Get current performance metrics per strategy."""
@@ -458,18 +477,28 @@ class LiveTradingEngine:
 
 
 def main():
-    """Run the live trading engine once."""
+    """Run the live trading engine continuously."""
+    print("Starting live trading engine...")
     engine = LiveTradingEngine(bankroll=BANKROLL)
-    result = engine.run_cycle()
-    print(f"Status: {result['status']}")
-    print(f"New trades: {result['new_trades']}")
-    print(f"Total trades: {result['total_trades']}")
     
-    if result['status'] == 'success':
-        perf = engine.get_strategy_performance()
-        print("\nStrategy Performance:")
-        for strat, metrics in perf.items():
-            print(f"  {strat}: P&L={metrics['total_pnl']:.3f}, Capital={metrics['current_capital']:.3f}, Trades={metrics['n_trades']}")
+    try:
+        while True:
+            try:
+                result = engine.run_cycle()
+                
+                # Print status summary (only if things happen or periodically)
+                if result['status'] != 'no_markets' or result['new_trades'] > 0:
+                    print(f"[{result['timestamp']}] Status: {result['status']} | New trades: {result['new_trades']} | Total: {result.get('total_trades', 0)}")
+                
+                # Sleep to avoid busy loop
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"Error in trading cycle: {e}")
+                time.sleep(5)
+                
+    except KeyboardInterrupt:
+        print("\nStopping trading engine...")
 
 
 if __name__ == "__main__":

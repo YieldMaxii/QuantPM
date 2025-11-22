@@ -5,6 +5,8 @@ Fetches current prices for selected markets every N seconds and updates
 data_live/ files for consumption by trading engine.
 """
 
+import sys
+print(f"SERVICE RUNNING WITH: {sys.executable}")
 import csv
 import time
 from dataclasses import dataclass
@@ -182,6 +184,10 @@ def fetch_and_update_live_data() -> Dict[str, Any]:
                 updated_count += 1
             else:
                 errors.append(f"{market.local_id}: Failed to fetch price")
+            
+            # Sleep to avoid rate limiting
+            time.sleep(0.1)
+            
         except Exception as e:
             errors.append(f"{market.local_id}: {str(e)}")
     
@@ -194,34 +200,38 @@ def fetch_and_update_live_data() -> Dict[str, Any]:
     }
 
 
-def run_live_data_service(update_interval: int = 60) -> None:
+def run_live_data_service(update_interval: int = 10) -> None:
     """
     Run the live data service continuously.
     Fetches data every update_interval seconds.
     """
     print(f"Starting live data service (update interval: {update_interval}s)")
-    print("Press Ctrl+C to stop")
+    print("Press Ctrl+C to stop", flush=True)
     
     try:
         while True:
             # Check for reset signal and clear cache if needed
             reset_signal_path = LOGS_LIVE_DIR / "reset_signal"
             if reset_signal_path.exists():
-                print("Reset signal detected. Clearing data service cache.")
+                print("Reset signal detected. Clearing data service cache.", flush=True)
                 global _market_info_cache, _market_info_cache_mtime
                 _market_info_cache = []
                 _market_info_cache_mtime = 0
                 # Note: Price CSV files are deleted by the reset button in dashboard
                 # We just need to clear our cache here
             
-            result = fetch_and_update_live_data()
-            print(f"[{result['timestamp']}] Updated {result['updated']}/{result['total']} markets")
-            if result.get("errors"):
-                for error in result["errors"]:
-                    print(f"  Error: {error}")
+            try:
+                result = fetch_and_update_live_data()
+                print(f"[{result['timestamp']}] Updated {result['updated']}/{result['total']} markets", flush=True)
+                if result.get("errors"):
+                    for error in result["errors"]:
+                        print(f"  Error: {error}", flush=True)
+            except Exception as e:
+                print(f"Error in fetch cycle: {e}", flush=True)
+                
             time.sleep(update_interval)
     except KeyboardInterrupt:
-        print("\nStopping live data service...")
+        print("\nStopping live data service...", flush=True)
 
 
 if __name__ == "__main__":
@@ -237,4 +247,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     run_live_data_service(args.interval)
-

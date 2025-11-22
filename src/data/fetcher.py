@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 import requests
 import urllib3
 
-from .polymarket_api import GAMMA_API_BASE, extract_yes_token_id, fetch_24h_history
+from .polymarket_api import GAMMA_API_BASE, extract_yes_token_id, fetch_current_price
 from src.trading.timer import get_timer_start_time
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -125,60 +125,17 @@ def select_target_markets() -> List[LiveMarket]:
     return selected
 
 
-def write_prices_csv(local_id: str, history: List[Dict[str, Any]]) -> float:
+def initialize_price_csv(local_id: str) -> None:
     """
-    Write data_live/prices_<local_id>.csv from history entries.
-    Filters out data from before the competition start time.
-
-    Returns:
-        last_price (float) to be used as "outcome" for this 24h window.
+    Initialize an empty price CSV file with only the header.
+    This ensures strategies start fresh from the competition start time.
     """
-    if not history:
-        raise ValueError(f"No history returned for {local_id}")
-
-    # Get timer start time to filter garbage data
-    timer_start = get_timer_start_time(TIMER_STATE_FILE)
-
     out_path = DATA_LIVE_DIR / f"prices_{local_id}.csv"
+    # Only overwrite if it doesn't exist or we want to force reset (assumed fresh start)
+    # Just truncate it to be safe for a fresh start
     with out_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["timestamp", "price", "bid", "ask", "volume"])
-
-        last_price = None
-        valid_points = 0
-        
-        for h in history:
-            t = h.get("t")
-            p = h.get("p")
-            if t is None or p is None:
-                continue
-            
-            ts_dt = datetime.fromtimestamp(int(t), tz=timezone.utc)
-            
-            # Filter out data from before competition start
-            if ts_dt < timer_start:
-                continue
-                
-            ts = ts_dt.isoformat()
-            price = float(p)  # clob prices are already in [0,1]
-            bid = max(0.0, price - 0.01)
-            ask = min(1.0, price + 0.01)
-            volume = 1000.0  # synthetic; your engine only needs price
-
-            writer.writerow([ts, f"{price:.6f}", f"{bid:.6f}", f"{ask:.6f}", f"{volume:.0f}"])
-            last_price = price
-            valid_points += 1
-
-    if last_price is None:
-        # If no data after start time, use the last available price from history as a fallback
-        # but don't write it as a historical point
-        if history:
-            last_h = history[-1]
-            if last_h.get("p") is not None:
-                return float(last_h["p"])
-        raise ValueError(f"Could not determine last price for {local_id} (no valid data after start time)")
-    
-    return last_price
 
 
 def write_markets_meta(live_markets: List[LiveMarket], outcomes: Dict[str, float]) -> None:
@@ -192,8 +149,8 @@ def write_markets_meta(live_markets: List[LiveMarket], outcomes: Dict[str, float
         writer = csv.writer(f)
         writer.writerow(["market_id", "name", "outcome", "slug", "event_slug", "condition_id", "yes_token_id", "last_updated"])
         for mk in live_markets:
-            last_price = outcomes[mk.local_id]
-            # Here we interpret "outcome" as the terminal 24h price (mark-to-market).
+            # outcome here is just the reference price at start
+            last_price = outcomes.get(mk.local_id, 0.5) 
             writer.writerow(
                 [
                     mk.local_id,
@@ -222,30 +179,32 @@ def main() -> None:
     final_markets = []
     outcomes: Dict[str, float] = {}
 
+    print("\nInitializing market files (fetching current price for metadata only)...")
+    
     for mk in live_markets:
-        print(f"\nFetching 24h 1-minute prices for {mk.local_id} ({mk.slug})...")
-        history = fetch_24h_history(mk.yes_token_id)
-        print(f"  Received {len(history)} history points")
+        # 1. Initialize empty price file
+        initialize_price_csv(mk.local_id)
         
-        if not history:
-            print(f"  WARNING: No history for {mk.local_id}. Skipping.")
-            continue
-
+        # 2. Fetch current price for metadata "outcome" reference
+        # We try to get a starting price so the dashboard isn't totally blank on outcomes
         try:
-            last_price = write_prices_csv(mk.local_id, history)
-            print(f"  Last price in window: {last_price:.4f}")
-            outcomes[mk.local_id] = last_price
+            current_price = fetch_current_price(mk.yes_token_id)
+            if current_price is None:
+                current_price = 0.5
+            
+            outcomes[mk.local_id] = current_price
             final_markets.append(mk)
+            print(f"  Initialized {mk.local_id} (Start Price: {current_price:.4f})")
+            
         except Exception as e:
-            print(f"  Error writing prices for {mk.local_id}: {e}")
+            print(f"  Error initializing {mk.local_id}: {e}")
             continue
 
     write_markets_meta(final_markets, outcomes)
     print("\nDone.")
     print(f"  - Markets meta: {DATA_LIVE_DIR/'markets_live_meta.csv'}")
-    print(f"  - Prices files: {DATA_LIVE_DIR}/prices_L*.csv")
+    print(f"  - Prices files: {DATA_LIVE_DIR}/prices_L*.csv (Initialized empty)")
 
 
 if __name__ == "__main__":
     main()
-
